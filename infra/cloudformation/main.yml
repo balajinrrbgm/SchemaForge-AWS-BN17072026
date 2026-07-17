@@ -1,0 +1,303 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SchemaForge — Open Innovation Track
+  Polyglot persistence: Aurora PostgreSQL Serverless v2 + DynamoDB
+  Aurora PG: user accounts, saved schemas, version history
+  DynamoDB: AI generation cache with TTL, popular templates
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  DBUsername:
+    Type: String
+    Default: schemaforge_admin
+    NoEcho: true
+  AppName:
+    Type: String
+    Default: schemaforge
+
+Resources:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # VPC
+  # ──────────────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-vpc
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub '${AppName}-private-1'}]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub '${AppName}-private-2'}]
+
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora PostgreSQL access for SchemaForge
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-aurora-sg
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda to Aurora egress
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-lambda-sg
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: SchemaForge Aurora subnet group
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Secrets Manager — Aurora credentials
+  # ──────────────────────────────────────────────────────────────────────────
+  DBCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /${AppName}/${Environment}/db-credentials
+      Description: Aurora PostgreSQL master credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Aurora PostgreSQL Serverless v2 — user data, schemas, version history
+  # ──────────────────────────────────────────────────────────────────────────
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub ${AppName}-aurora-${Environment}
+      Engine: aurora-postgresql
+      EngineVersion: '16.2'
+      EngineMode: provisioned
+      DatabaseName: schemaforge
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBCredentialsSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBCredentialsSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: [!Ref AuroraSecurityGroup]
+      StorageEncrypted: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 16
+      BackupRetentionPeriod: 7
+      EnableCloudwatchLogsExports: [postgresql]
+      Tags:
+        - Key: Project
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AuroraWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-writer
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # DynamoDB — AI generation cache (TTL) + popular templates + export jobs
+  # DynamoDB shines here: massive read throughput, cache-like key access, auto-expiry
+  # ──────────────────────────────────────────────────────────────────────────
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub ${AppName}-cache-${Environment}
+      BillingMode: PAY_PER_REQUEST   # On-demand — scales with cache traffic
+      TableClass: STANDARD           # Standard table class for hot cache
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      # Entity types:
+      #   SCHEMA_CACHE#<sha256-of-prompt>  SK=DATA     → Cached generated schema (TTL 24h)
+      #   POPULAR#<db-type>               SK=TEMPLATE#<type>  → Popular template counters
+      #   EXPORT_JOB#<jobId>              SK=STATUS   → CloudFormation export job tracking
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt   # Epoch seconds — DynamoDB auto-deletes expired cache entries
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref AppName
+        - Key: Purpose
+          Value: AI-cache-and-jobs
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Lambda — async CloudFormation template generation (for large templates)
+  # ──────────────────────────────────────────────────────────────────────────
+  AsyncGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DynamoDbCacheAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt CacheTable.Arn
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DBCredentialsSecret
+
+  AsyncCfnGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-async-cfn-gen-${Environment}
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt AsyncGeneratorRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      Environment:
+        Variables:
+          DYNAMODB_CACHE_TABLE: !Ref CacheTable
+          DB_SECRET_ARN: !Ref DBCredentialsSecret
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            // Async CloudFormation template generation
+            // Triggered via API Gateway when generation > 10 seconds
+            const { jobId, prompt, targetDatabase } = JSON.parse(event.body ?? '{}');
+            console.log('Async gen job:', jobId, targetDatabase);
+            return { statusCode: 200, body: JSON.stringify({ jobId, status: 'queued' }) };
+          };
+      Tags:
+        - Key: Project
+          Value: !Ref AppName
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # CloudWatch — Monitor Aurora + DynamoDB usage
+  # ──────────────────────────────────────────────────────────────────────────
+  CacheHitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AppName}-low-cache-hit-rate
+      AlarmDescription: DynamoDB cache hit rate dropped — investigate AI cost spike
+      MetricName: SuccessfulRequestLatency
+      Namespace: AWS/DynamoDB
+      Statistic: SampleCount
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref CacheTable
+        - Name: Operation
+          Value: GetItem
+
+  AuroraCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AppName}-aurora-high-cpu
+      AlarmDescription: Aurora CPU above 80% — schema queries scaling unexpectedly
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+
+# ──────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────
+Outputs:
+  AuroraClusterEndpoint:
+    Description: Aurora PostgreSQL writer endpoint (user data, schemas, version history)
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub ${AppName}-aurora-endpoint
+
+  DynamoCacheTableName:
+    Description: DynamoDB cache table name (AI generation cache, TTL)
+    Value: !Ref CacheTable
+    Export:
+      Name: !Sub ${AppName}-cache-table
+
+  DynamoCacheTableArn:
+    Description: DynamoDB cache table ARN
+    Value: !GetAtt CacheTable.Arn
+
+  DBCredentialsSecretArn:
+    Description: Secrets Manager secret ARN for Aurora credentials
+    Value: !Ref DBCredentialsSecret
+    Export:
+      Name: !Sub ${AppName}-db-secret-arn
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
